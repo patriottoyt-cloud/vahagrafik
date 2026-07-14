@@ -212,17 +212,28 @@ function buildSchedule(period, requirements, prefsByWaiter, roster) {
           missing: stillShort,
         });
       }
-      overflow.forEach((n) => {
-        issues.push({ type: 'overflow', date, time: slot.time, name: n });
-      });
     }
 
-    // waiters who wanted this date but got nothing (all their slots were unavailable/rest-blocked)
+    // Which slots on this date still have open seats (after both fill passes)?
+    const shortfallSlots = slots.filter((slot) => (schedule[date][slot.time] || []).length < slot.count);
+
+    // Anyone who explicitly wanted to work this day but didn't get placed —
+    // paired with a concrete alternative time if one still has room, so it's
+    // a real ask ("come at 10:00 instead") rather than just a complaint.
     roster.forEach((name) => {
       const p = prefsByWaiter[name] && prefsByWaiter[name][date];
-      if (p && p.status === 'work' && !assignedToday.has(name)) {
-        issues.push({ type: 'unassigned', date, name, note: p.note || '' });
-      }
+      if (!p || p.status !== 'work' || assignedToday.has(name)) return;
+      const restOkHere = (time) => !(time === '10:00' && !restOk(name));
+      const suggestions = shortfallSlots.filter((slot) => restOkHere(slot.time)).map((slot) => slot.time);
+      issues.push({
+        type: 'conflict',
+        date,
+        name,
+        wanted: p.times && p.times.length ? p.times.join(', ') : 'любое время',
+        mustHave: !!p.mustHave,
+        note: p.note || '',
+        suggestions,
+      });
     });
   }
 
@@ -871,9 +882,14 @@ function SubmissionsTab({ roster, period, dates, prefsByWaiter, onRefresh }) {
 /* ---------- Schedule tab ---------- */
 function ScheduleTab({ period, dates, requirements, roster, result, onBuild, building, editableSchedule, setEditableSchedule, onSaveFinal, savingSchedule, prefsByWaiter }) {
   const issues = result ? result.issues : [];
-  const shortageIssues = issues.filter((i) => i.type === 'shortage');
-  const overflowIssues = issues.filter((i) => i.type === 'overflow');
-  const unassignedIssues = issues.filter((i) => i.type === 'unassigned');
+  const issuesByDate = useMemo(() => {
+    const map = {};
+    issues.forEach((i) => {
+      (map[i.date] = map[i.date] || []).push(i);
+    });
+    return map;
+  }, [issues]);
+  const issueDates = Object.keys(issuesByDate).sort();
 
   const setCellPerson = (date, time, idx, newName) => {
     setEditableSchedule((prev) => {
@@ -913,27 +929,52 @@ function ScheduleTab({ period, dates, requirements, roster, result, onBuild, bui
 
       {result && (
         <>
-          {(shortageIssues.length > 0 || overflowIssues.length > 0 || unassignedIssues.length > 0) && (
-            <div className="vaha-card p-4 mb-5" style={{ borderColor: BRAND.rust }}>
+          {issueDates.length > 0 && (
+            <div className="mb-5">
               <div className="font-semibold mb-3 inline-flex items-center gap-2" style={{ color: BRAND.rust }}>
-                <AlertTriangle size={16} /> Нужно решить лично
+                <AlertTriangle size={16} /> Нужно решить лично — {issueDates.length} {issueDates.length === 1 ? 'день' : 'дней'}
               </div>
-              <div className="space-y-1.5 text-sm">
-                {shortageIssues.map((i, k) => (
-                  <div key={k} style={{ color: BRAND.ink }}>
-                    <b>Не хватает {i.missing}</b> на {fmtDate(i.date, false)} ({RU_WD_FULL[weekdayOf(i.date)]}), смена {i.time}
-                  </div>
-                ))}
-                {overflowIssues.map((i, k) => (
-                  <div key={k} style={{ color: BRAND.inkSoft }}>
-                    <b>{i.name}</b> хотел(а) {fmtDate(i.date, false)} {i.time}, но слоты уже заняты
-                  </div>
-                ))}
-                {unassignedIssues.map((i, k) => (
-                  <div key={k} style={{ color: BRAND.inkSoft }}>
-                    <b>{i.name}</b> хотел(а) работать {fmtDate(i.date, false)}, но не подошло ни одно время{i.note ? ` — «${i.note}»` : ''}
-                  </div>
-                ))}
+              <div className="space-y-3">
+                {issueDates.map((date) => {
+                  const dayIssues = issuesByDate[date];
+                  const shortages = dayIssues.filter((i) => i.type === 'shortage');
+                  const conflicts = dayIssues.filter((i) => i.type === 'conflict');
+                  return (
+                    <div key={date} className="vaha-card p-4" style={{ borderColor: '#E3B3A8' }}>
+                      <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
+                        <div className="font-semibold capitalize">{fmtDate(date)}</div>
+                        <div className="flex gap-1.5 flex-wrap">
+                          {shortages.map((s, k) => (
+                            <span
+                              key={k}
+                              className="text-[11px] px-2 py-1 rounded-full font-medium"
+                              style={{ background: '#F3E4DD', color: BRAND.rust }}
+                            >
+                              не хватает {s.missing} на {s.time}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                      <div className="space-y-1.5 text-sm">
+                        {conflicts.map((c, k) => (
+                          <div key={k}>
+                            <b style={{ color: BRAND.ink }}>{c.name}</b>
+                            {c.mustHave && <span style={{ color: BRAND.rust }}> ⚠ обязательно</span>}
+                            <span style={{ color: BRAND.inkSoft }}> хотел(а) {c.wanted}</span>
+                            {c.suggestions.length > 0 ? (
+                              <span style={{ color: BRAND.inkSoft }}>
+                                {' '}— свободно на <b style={{ color: BRAND.sage }}>{c.suggestions.join(', ')}</b>, можно предложить
+                              </span>
+                            ) : (
+                              <span style={{ color: BRAND.inkSoft }}> — свободных мест в этот день больше нет</span>
+                            )}
+                            {c.note && <span style={{ color: BRAND.inkSoft }}> («{c.note}»)</span>}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           )}
