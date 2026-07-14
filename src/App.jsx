@@ -2,9 +2,10 @@ import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import {
   Users, CalendarDays, Settings2, CheckCircle2, AlertTriangle, User,
   ShieldCheck, Plus, X, ChevronLeft, Save, RefreshCw, Clock, Trash2,
-  ArrowLeft, Wand2, PenLine, Info
+  ArrowLeft, Wand2, PenLine, Info, FileDown
 } from 'lucide-react';
 import { storageGet, storageSet, storageList } from './storage';
+import * as XLSX from 'xlsx';
 
 /* ---------- brand tokens (Ваха Лавка) ---------- */
 const BRAND = {
@@ -238,6 +239,49 @@ function buildSchedule(period, requirements, prefsByWaiter, roster) {
   }
 
   return { schedule, issues };
+}
+
+/* ---------- Excel export ---------- */
+function exportScheduleToExcel(period, dates, requirements, roster, schedule, issues) {
+  const header = ['ФИО', ...dates.map((d) => `${fmtDate(d, false)} (${RU_WD_SHORT[weekdayOf(d)]})`)];
+  const rows = roster.map((name) => {
+    const row = [name];
+    dates.forEach((date) => {
+      const day = schedule[date] || {};
+      const times = Object.keys(day)
+        .filter((k) => !k.endsWith('__flex') && Array.isArray(day[k]) && day[k].includes(name))
+        .sort();
+      row.push(times.join(', '));
+    });
+    return row;
+  });
+  const ws = XLSX.utils.aoa_to_sheet([header, ...rows]);
+  ws['!cols'] = [{ wch: 22 }, ...dates.map(() => ({ wch: 12 }))];
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'График');
+
+  if (issues && issues.length) {
+    const issueHeader = ['Дата', 'Тип', 'Детали'];
+    const issueRows = issues.map((i) => {
+      if (i.type === 'shortage') {
+        return [fmtDate(i.date, false), 'Не хватает людей', `${i.time} — не хватает ${i.missing}`];
+      }
+      const suggestion = i.suggestions && i.suggestions.length
+        ? `свободно на ${i.suggestions.join(', ')}`
+        : 'свободных мест в этот день нет';
+      return [
+        fmtDate(i.date, false),
+        'Не пристроен(а)',
+        `${i.name} хотел(а) ${i.wanted}${i.mustHave ? ' (обязательно)' : ''} — ${suggestion}${i.note ? ` («${i.note}»)` : ''}`,
+      ];
+    });
+    const ws2 = XLSX.utils.aoa_to_sheet([issueHeader, ...issueRows]);
+    ws2['!cols'] = [{ wch: 16 }, { wch: 18 }, { wch: 70 }];
+    XLSX.utils.book_append_sheet(wb, ws2, 'Нужно решить');
+  }
+
+  XLSX.writeFile(wb, `график_${period.start}_${period.end}.xlsx`);
 }
 
 /* ---------- small UI atoms ---------- */
@@ -552,6 +596,21 @@ function AdminView({ onBack }) {
     if (!loading) loadSubmissions();
   }, [loading, tab, loadSubmissions]);
 
+  // Restore a previously saved schedule for this period, so leaving and
+  // coming back doesn't wipe it out.
+  useEffect(() => {
+    if (loading || tab !== 'schedule' || result) return;
+    (async () => {
+      const saved = await storageGet(`schedule:${periodKey(period)}`, true);
+      if (saved) {
+        const sched = saved.schedule || saved; // tolerate the older raw-schedule save format
+        const iss = saved.issues || [];
+        setResult({ schedule: sched, issues: iss });
+        setEditableSchedule(sched);
+      }
+    })();
+  }, [loading, tab, period, result]);
+
   const runBuild = async () => {
     setBuilding(true);
     const map = await loadSubmissions();
@@ -564,7 +623,7 @@ function AdminView({ onBack }) {
 
   const saveFinalSchedule = async () => {
     setSavingSchedule(true);
-    await storageSet(`schedule:${periodKey(period)}`, editableSchedule);
+    await storageSet(`schedule:${periodKey(period)}`, { schedule: editableSchedule, issues: result ? result.issues : [] }, true);
     setSavingSchedule(false);
   };
 
@@ -1043,9 +1102,18 @@ function ScheduleTab({ period, dates, requirements, roster, result, onBuild, bui
             </table>
           </div>
 
-          <Btn onClick={onSaveFinal} disabled={savingSchedule} className="w-full justify-center mt-4">
-            <Save size={16} />{savingSchedule ? 'Сохраняю…' : 'Сохранить итоговый график'}
-          </Btn>
+          <div className="flex flex-col sm:flex-row gap-3 mt-4">
+            <Btn onClick={onSaveFinal} disabled={savingSchedule} className="flex-1 justify-center">
+              <Save size={16} />{savingSchedule ? 'Сохраняю…' : 'Сохранить итоговый график'}
+            </Btn>
+            <Btn
+              variant="ghost"
+              className="flex-1 justify-center"
+              onClick={() => exportScheduleToExcel(period, dates, requirements, roster, editableSchedule, issues)}
+            >
+              <FileDown size={16} />Скачать Excel
+            </Btn>
+          </div>
           <p className="text-xs text-center mt-2 inline-flex items-center gap-1 w-full justify-center" style={{ color: BRAND.inkSoft }}>
             <PenLine size={12} /> Ячейки можно править вручную перед сохранением
           </p>
