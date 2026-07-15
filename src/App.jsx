@@ -5,7 +5,7 @@ import {
   ArrowLeft, Wand2, PenLine, Info, FileDown
 } from 'lucide-react';
 import { storageGet, storageSet, storageList } from './storage';
-import * as XLSX from 'xlsx';
+import ExcelJS from 'exceljs';
 
 /* ---------- brand tokens (Ваха Лавка) ---------- */
 const BRAND = {
@@ -128,7 +128,6 @@ function defaultPeriod() {
 function buildSchedule(period, requirements, prefsByWaiter, roster) {
   const dates = enumerateDates(period.start, period.end);
   const schedule = {};
-  const issues = [];
   const lastShift = {};
   const shiftCount = {};
   roster.forEach((n) => (shiftCount[n] = 0));
@@ -148,7 +147,6 @@ function buildSchedule(period, requirements, prefsByWaiter, roster) {
     for (const slot of slots) {
       const need = slot.count;
 
-      // Pass 1: people who asked for this day with a matching (or "any") time.
       let candidates = roster.filter((name) => {
         const p = prefsByWaiter[name] && prefsByWaiter[name][date];
         if (!p || p.status !== 'work') return false;
@@ -166,7 +164,6 @@ function buildSchedule(period, requirements, prefsByWaiter, roster) {
       });
 
       const chosen = candidates.slice(0, need);
-      const overflow = candidates.slice(need);
       const flexUsed = [];
 
       chosen.forEach((n) => {
@@ -175,8 +172,6 @@ function buildSchedule(period, requirements, prefsByWaiter, roster) {
         lastShift[n] = { date, time: slot.time };
       });
 
-      // Pass 2: "На ваше усмотрение" fills whatever is still short — fair
-      // (fewest shifts so far) with a random tiebreak among equals.
       let stillShort = need - chosen.length;
       if (stillShort > 0) {
         let flexCandidates = roster.filter((name) => {
@@ -199,32 +194,58 @@ function buildSchedule(period, requirements, prefsByWaiter, roster) {
           chosen.push(n);
           flexUsed.push(n);
         });
-        stillShort -= flexChosen.length;
       }
 
       schedule[date][slot.time] = chosen;
       schedule[date][`${slot.time}__flex`] = flexUsed;
-
-      if (stillShort > 0) {
-        issues.push({
-          type: 'shortage',
-          date,
-          time: slot.time,
-          missing: stillShort,
-        });
-      }
     }
+  }
 
-    // Which slots on this date still have open seats (after both fill passes)?
-    const shortfallSlots = slots.filter((slot) => (schedule[date][slot.time] || []).length < slot.count);
+  const issues = deriveIssues(dates, requirements, schedule, prefsByWaiter, roster);
+  return { schedule, issues };
+}
 
-    // Anyone who explicitly wanted to work this day but didn't get placed —
-    // paired with a concrete alternative time if one still has room, so it's
-    // a real ask ("come at 10:00 instead") rather than just a complaint.
+// Recomputes the "нужно решить лично" list from whatever is CURRENTLY in the
+// schedule grid — including manual admin edits — rather than from a frozen
+// snapshot. Call this any time the grid changes so fixed issues disappear
+// and new ones (if a manual edit creates a gap) show up immediately.
+function deriveIssues(dates, requirements, schedule, prefsByWaiter, roster) {
+  const issues = [];
+  const shiftOnDate = {};
+  roster.forEach((n) => (shiftOnDate[n] = {}));
+  dates.forEach((date) => {
+    const day = schedule[date] || {};
+    Object.keys(day).forEach((key) => {
+      if (key.endsWith('__flex')) return;
+      (day[key] || []).forEach((name) => {
+        if (!shiftOnDate[name]) shiftOnDate[name] = {};
+        shiftOnDate[name][date] = key;
+      });
+    });
+  });
+
+  dates.forEach((date) => {
+    const weekday = weekdayOf(date);
+    const slots = requirements[weekday] || [];
+    const day = schedule[date] || {};
+    const prevDate = addDaysStr(date, -1);
+
+    const shortfallSlots = slots.filter((slot) => (day[slot.time] || []).length < slot.count);
+    shortfallSlots.forEach((slot) => {
+      issues.push({ type: 'shortage', date, time: slot.time, missing: slot.count - (day[slot.time] || []).length });
+    });
+
+    const assignedToday = new Set();
+    slots.forEach((slot) => (day[slot.time] || []).forEach((n) => assignedToday.add(n)));
+
     roster.forEach((name) => {
       const p = prefsByWaiter[name] && prefsByWaiter[name][date];
       if (!p || p.status !== 'work' || assignedToday.has(name)) return;
-      const restOkHere = (time) => !(time === '10:00' && !restOk(name));
+      const restOkHere = (time) => {
+        if (time !== '10:00') return true;
+        const prevTime = shiftOnDate[name] && shiftOnDate[name][prevDate];
+        return !(prevTime && prevTime !== '10:00');
+      };
       const suggestions = shortfallSlots.filter((slot) => restOkHere(slot.time)).map((slot) => slot.time);
       issues.push({
         type: 'conflict',
@@ -236,52 +257,115 @@ function buildSchedule(period, requirements, prefsByWaiter, roster) {
         suggestions,
       });
     });
-  }
+  });
 
-  return { schedule, issues };
+  return issues;
 }
 
-/* ---------- Excel export ---------- */
-function exportScheduleToExcel(period, dates, requirements, roster, schedule, issues) {
-  const header = ['ФИО', ...dates.map((d) => `${fmtDate(d, false)} (${RU_WD_SHORT[weekdayOf(d)]})`)];
-  const rows = roster.map((name) => {
-    const row = [name];
-    dates.forEach((date) => {
+/* ---------- Excel export (styled like the master schedule file) ---------- */
+const XLSX_TERRACOTTA = 'FFB74332';
+const XLSX_YELLOW = 'FFFFFF00';
+const XLSX_BORDER = 'FFE4D9C8';
+
+async function exportScheduleToExcel(period, dates, requirements, roster, schedule, issues) {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Ваха Лавка';
+  const ws = wb.addWorksheet('График');
+
+  ws.getColumn(1).width = 22;
+  dates.forEach((_, i) => {
+    ws.getColumn(i + 2).width = 9;
+  });
+
+  const weekdayRow = ws.getRow(1);
+  weekdayRow.getCell(1).value = 'Ваха Лавка';
+  dates.forEach((date, i) => {
+    weekdayRow.getCell(i + 2).value = RU_WD_SHORT[weekdayOf(date)];
+  });
+
+  const dayRow = ws.getRow(2);
+  dayRow.getCell(1).value = 'ФИО';
+  let prevMonth = null;
+  dates.forEach((date, i) => {
+    const [, m, day] = date.split('-').map(Number);
+    dayRow.getCell(i + 2).value = prevMonth === null || m !== prevMonth ? `${day}.${String(m).padStart(2, '0')}` : day;
+    prevMonth = m;
+  });
+
+  [weekdayRow, dayRow].forEach((row) => {
+    row.eachCell({ includeEmpty: true }, (cell) => {
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: XLSX_TERRACOTTA } };
+      cell.font = { color: { argb: 'FFFFFFFF' }, bold: true };
+      cell.alignment = { horizontal: 'center', vertical: 'middle' };
+    });
+  });
+
+  roster.forEach((name, r) => {
+    const row = ws.getRow(r + 3);
+    row.getCell(1).value = name;
+    row.getCell(1).font = { bold: true };
+    dates.forEach((date, i) => {
       const day = schedule[date] || {};
       const times = Object.keys(day)
         .filter((k) => !k.endsWith('__flex') && Array.isArray(day[k]) && day[k].includes(name))
         .sort();
-      row.push(times.join(', '));
+      const cell = row.getCell(i + 2);
+      cell.alignment = { horizontal: 'center' };
+      if (times.length) {
+        cell.value = times.join(', ');
+      } else {
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: XLSX_YELLOW } };
+      }
     });
-    return row;
   });
-  const ws = XLSX.utils.aoa_to_sheet([header, ...rows]);
-  ws['!cols'] = [{ wch: 22 }, ...dates.map(() => ({ wch: 12 }))];
 
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, 'График');
+  const lastRow = roster.length + 2;
+  const lastCol = dates.length + 1;
+  const thin = { style: 'thin', color: { argb: XLSX_BORDER } };
+  for (let r = 1; r <= lastRow; r++) {
+    for (let c = 1; c <= lastCol; c++) {
+      ws.getCell(r, c).border = { top: thin, bottom: thin, left: thin, right: thin };
+    }
+  }
+  ws.views = [{ state: 'frozen', xSplit: 1, ySplit: 2 }];
 
   if (issues && issues.length) {
-    const issueHeader = ['Дата', 'Тип', 'Детали'];
-    const issueRows = issues.map((i) => {
-      if (i.type === 'shortage') {
-        return [fmtDate(i.date, false), 'Не хватает людей', `${i.time} — не хватает ${i.missing}`];
-      }
-      const suggestion = i.suggestions && i.suggestions.length
-        ? `свободно на ${i.suggestions.join(', ')}`
-        : 'свободных мест в этот день нет';
-      return [
-        fmtDate(i.date, false),
-        'Не пристроен(а)',
-        `${i.name} хотел(а) ${i.wanted}${i.mustHave ? ' (обязательно)' : ''} — ${suggestion}${i.note ? ` («${i.note}»)` : ''}`,
-      ];
+    const ws2 = wb.addWorksheet('Нужно решить');
+    ws2.columns = [
+      { header: 'Дата', key: 'date', width: 16 },
+      { header: 'Тип', key: 'type', width: 18 },
+      { header: 'Детали', key: 'details', width: 70 },
+    ];
+    ws2.getRow(1).eachCell((cell) => {
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: XLSX_TERRACOTTA } };
+      cell.font = { color: { argb: 'FFFFFFFF' }, bold: true };
     });
-    const ws2 = XLSX.utils.aoa_to_sheet([issueHeader, ...issueRows]);
-    ws2['!cols'] = [{ wch: 16 }, { wch: 18 }, { wch: 70 }];
-    XLSX.utils.book_append_sheet(wb, ws2, 'Нужно решить');
+    issues.forEach((i) => {
+      if (i.type === 'shortage') {
+        ws2.addRow({ date: fmtDate(i.date, false), type: 'Не хватает людей', details: `${i.time} — не хватает ${i.missing}` });
+      } else {
+        const suggestion = i.suggestions && i.suggestions.length
+          ? `свободно на ${i.suggestions.join(', ')}`
+          : 'свободных мест в этот день нет';
+        ws2.addRow({
+          date: fmtDate(i.date, false),
+          type: 'Не пристроен(а)',
+          details: `${i.name} хотел(а) ${i.wanted}${i.mustHave ? ' (обязательно)' : ''} — ${suggestion}${i.note ? ` («${i.note}»)` : ''}`,
+        });
+      }
+    });
   }
 
-  XLSX.writeFile(wb, `график_${period.start}_${period.end}.xlsx`);
+  const buf = await wb.xlsx.writeBuffer();
+  const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `график_${period.start}_${period.end}.xlsx`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 /* ---------- small UI atoms ---------- */
@@ -555,7 +639,6 @@ function AdminView({ onBack }) {
   const [loading, setLoading] = useState(true);
   const [savingConfig, setSavingConfig] = useState(false);
   const [prefsByWaiter, setPrefsByWaiter] = useState({});
-  const [result, setResult] = useState(null); // {schedule, issues}
   const [building, setBuilding] = useState(false);
   const [editableSchedule, setEditableSchedule] = useState(null);
   const [savingSchedule, setSavingSchedule] = useState(false);
@@ -599,23 +682,20 @@ function AdminView({ onBack }) {
   // Restore a previously saved schedule for this period, so leaving and
   // coming back doesn't wipe it out.
   useEffect(() => {
-    if (loading || tab !== 'schedule' || result) return;
+    if (loading || tab !== 'schedule' || editableSchedule) return;
     (async () => {
-      const saved = await storageGet(`schedule:${periodKey(period)}`, true);
+      const saved = await storageGet(`schedule:${periodKey(period)}`);
       if (saved) {
-        const sched = saved.schedule || saved; // tolerate the older raw-schedule save format
-        const iss = saved.issues || [];
-        setResult({ schedule: sched, issues: iss });
+        const sched = saved.schedule || saved; // tolerate the older wrapped save format
         setEditableSchedule(sched);
       }
     })();
-  }, [loading, tab, period, result]);
+  }, [loading, tab, period, editableSchedule]);
 
   const runBuild = async () => {
     setBuilding(true);
     const map = await loadSubmissions();
     const res = buildSchedule(period, requirements, map, roster);
-    setResult(res);
     setEditableSchedule(res.schedule);
     setBuilding(false);
     setTab('schedule');
@@ -623,7 +703,7 @@ function AdminView({ onBack }) {
 
   const saveFinalSchedule = async () => {
     setSavingSchedule(true);
-    await storageSet(`schedule:${periodKey(period)}`, { schedule: editableSchedule, issues: result ? result.issues : [] }, true);
+    await storageSet(`schedule:${periodKey(period)}`, editableSchedule);
     setSavingSchedule(false);
   };
 
@@ -673,7 +753,6 @@ function AdminView({ onBack }) {
           dates={dates}
           requirements={requirements}
           roster={roster}
-          result={result}
           onBuild={runBuild}
           building={building}
           editableSchedule={editableSchedule}
@@ -939,8 +1018,11 @@ function SubmissionsTab({ roster, period, dates, prefsByWaiter, onRefresh }) {
 }
 
 /* ---------- Schedule tab ---------- */
-function ScheduleTab({ period, dates, requirements, roster, result, onBuild, building, editableSchedule, setEditableSchedule, onSaveFinal, savingSchedule, prefsByWaiter }) {
-  const issues = result ? result.issues : [];
+function ScheduleTab({ period, dates, requirements, roster, onBuild, building, editableSchedule, setEditableSchedule, onSaveFinal, savingSchedule, prefsByWaiter }) {
+  const issues = useMemo(() => {
+    if (!editableSchedule) return [];
+    return deriveIssues(dates, requirements, editableSchedule, prefsByWaiter, roster);
+  }, [editableSchedule, dates, requirements, prefsByWaiter, roster]);
   const issuesByDate = useMemo(() => {
     const map = {};
     issues.forEach((i) => {
@@ -980,13 +1062,13 @@ function ScheduleTab({ period, dates, requirements, roster, result, onBuild, bui
         </Btn>
       </div>
 
-      {!result && (
+      {!editableSchedule && (
         <div className="vaha-card p-6 text-center" style={{ color: BRAND.inkSoft }}>
           Нажмите «Собрать график» — соберём его из пожеланий официантов.
         </div>
       )}
 
-      {result && (
+      {editableSchedule && (
         <>
           {issueDates.length > 0 && (
             <div className="mb-5">
@@ -1109,7 +1191,7 @@ function ScheduleTab({ period, dates, requirements, roster, result, onBuild, bui
             <Btn
               variant="ghost"
               className="flex-1 justify-center"
-              onClick={() => exportScheduleToExcel(period, dates, requirements, roster, editableSchedule, issues)}
+              onClick={async () => exportScheduleToExcel(period, dates, requirements, roster, editableSchedule, issues)}
             >
               <FileDown size={16} />Скачать Excel
             </Btn>
